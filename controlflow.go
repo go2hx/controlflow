@@ -1,6 +1,7 @@
 package controlflow
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/printer"
@@ -11,6 +12,7 @@ import (
 func findLabelOffset(stmts []ast.Stmt, target *ast.Object) int {
 	for i, stmt := range stmts {
 		if label, ok := stmt.(*ast.LabeledStmt); ok && label.Label.Obj == target {
+			//fmt.Println(label.Label.Obj.Name, target.Name)
 			return i
 		}
 	}
@@ -22,6 +24,38 @@ func conditionalGotoLabel(stmt ast.Stmt) *ast.Object {
 		if node.Else == nil && node.Init == nil && len(node.Body.List) == 1 {
 			if branchStmt, ok := node.Body.List[0].(*ast.BranchStmt); ok {
 				if branchStmt.Tok == token.GOTO {
+					if branchStmt.Label.Obj == nil {
+						panic("BranchStmt with no matching Object")
+					}
+					return branchStmt.Label.Obj
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func conditionalContinueLabel(stmt ast.Stmt) *ast.Object {
+	if node, ok := stmt.(*ast.IfStmt); ok {
+		if node.Else == nil && node.Init == nil && len(node.Body.List) == 1 {
+			if branchStmt, ok := node.Body.List[0].(*ast.BranchStmt); ok {
+				if branchStmt.Tok == token.CONTINUE && branchStmt.Label != nil {
+					if branchStmt.Label.Obj == nil {
+						panic("BranchStmt with no matching Object")
+					}
+					return branchStmt.Label.Obj
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func conditionalBreakLabel(stmt ast.Stmt) *ast.Object {
+	if node, ok := stmt.(*ast.IfStmt); ok {
+		if node.Else == nil && node.Init == nil && len(node.Body.List) == 1 {
+			if branchStmt, ok := node.Body.List[0].(*ast.BranchStmt); ok {
+				if branchStmt.Tok == token.BREAK && branchStmt.Label != nil {
 					if branchStmt.Label.Obj == nil {
 						panic("BranchStmt with no matching Object")
 					}
@@ -54,15 +88,18 @@ func (fs *funcScope) tempVar(lbl *ast.Object) *ast.Ident {
 // pre: stmts only contains conditional gotos at the top level
 // post: stmts only contains conditional gotos for labels defined in an outer scope
 func (fs *funcScope) elimSiblings(stmts []ast.Stmt) []ast.Stmt {
+	//exists := map[string]bool{}
 	for {
 		// Find a goto pointing with a label inside the current block
 		gotoOffset := -1
 		lblOffset := -1
 		for i := range stmts {
-
 			// Is this a conditional goto?
 			if lbl := conditionalGotoLabel(stmts[i]); lbl != nil {
-
+				/*if exists[lbl.Name] {
+					continue
+				}
+				exists[lbl.Name] = true*/
 				// Find the matching label
 				lblOffset = findLabelOffset(stmts, lbl)
 
@@ -98,6 +135,7 @@ func (fs *funcScope) elimSiblings(stmts []ast.Stmt) []ast.Stmt {
 			newStmts = append(newStmts, stmts[:lblOffset]...)
 			var loopBody []ast.Stmt
 			loopBody = append(loopBody, labelStmt.Stmt)
+			loopBody = append(loopBody, assign(ast.NewIdent("goto"+labelStmt.Label.Name), astFalse))
 			loopBody = append(loopBody, stmts[lblOffset+1:gotoOffset]...)
 			loopBody = append(loopBody, makeIf(not(condition), []ast.Stmt{makeBreak()}))
 			newStmts = append(newStmts, labeled(labelStmt.Label, &ast.EmptyStmt{}))
@@ -150,6 +188,13 @@ func makeElseBlock(stmts []ast.Stmt) ast.Stmt {
 		}
 	}
 	return &ast.BlockStmt{List: stmts}
+}
+
+func printExpr(node any) {
+	var buf bytes.Buffer
+	fset := token.NewFileSet()
+	printer.Fprint(&buf, fset, node)
+	fmt.Println(buf.String())
 }
 
 // pre: if body contains only gotos that refer to an outer label
@@ -220,6 +265,7 @@ func (fs *funcScope) elimGotos(stmt ast.Stmt) []ast.Stmt {
 	case *ast.IfStmt:
 		// Only recurse if this is not a simple conditional goto
 		if conditionalGotoLabel(stmt) == nil {
+			// 1
 			stmt = replaceIfBody(stmt, fs.elimGotos(stmt.Body))
 			elseBlock := stmt.Else
 			stmt = &ast.IfStmt{
@@ -232,6 +278,7 @@ func (fs *funcScope) elimGotos(stmt ast.Stmt) []ast.Stmt {
 			}
 			// Now body only contains gotos where the label is in an outer scope
 			// Move these gotos out one level
+			//stmts = []ast.Stmt{stmt}
 			stmts = fs.moveGotosOutOfIf(stmt)
 		} else {
 			stmts = []ast.Stmt{stmt}
@@ -257,6 +304,8 @@ func (fs *funcScope) elimGotos(stmt ast.Stmt) []ast.Stmt {
 	case *ast.BlockStmt:
 		var newStmts []ast.Stmt
 		for _, bodyStmt := range stmt.List {
+			// printExpr(bodyStmt)
+			// 0
 			newStmts = append(newStmts, fs.elimGotos(bodyStmt)...)
 		}
 		stmts = newStmts
@@ -270,6 +319,12 @@ func (fs *funcScope) elimGotos(stmt ast.Stmt) []ast.Stmt {
 		// Unconditional goto. Wrap in "if true { goto L }"
 		if stmt.Tok == token.GOTO {
 			stmts = fs.elimGotos(&ast.IfStmt{Cond: astTrue, Body: &ast.BlockStmt{List: []ast.Stmt{stmt}}})
+		} else if stmt.Tok == token.CONTINUE && stmt.Label != nil {
+			stmts = []ast.Stmt{stmt}
+			//stmts = fs.elimGotos(&ast.IfStmt{Cond: astTrue, Body: &ast.BlockStmt{List: []ast.Stmt{stmt}}})
+		} else if stmt.Tok == token.BREAK && stmt.Label != nil {
+			stmts = []ast.Stmt{stmt}
+			//stmts = fs.elimGotos(&ast.IfStmt{Cond: astTrue, Body: &ast.BlockStmt{List: []ast.Stmt{stmt}}})
 		} else {
 			stmts = []ast.Stmt{stmt}
 		}
